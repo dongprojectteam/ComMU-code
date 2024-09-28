@@ -17,7 +17,7 @@ class PreprocessPipeline:
             self,
             root_dir: Union[str, Path],
             csv_path: Union[str, Path],
-            num_cores: int = max(4, cpu_count() - 2),
+            num_cores: int,
     ):
         meta_parser = MetaParser()
         meta_encoder = MetaEncoder()

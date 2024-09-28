@@ -19,6 +19,9 @@ from .utils.exceptions import UnprocessableMidiError
 from .encoder import MetaEncoder, EventSequenceEncoder
 from .parser import MetaParser
 
+import uuid
+from collections import Counter
+
 MIDI_EXTENSIONS = (".mid", ".MID", ".midi", ".MIDI")
 
 
@@ -59,7 +62,6 @@ def get_output_sub_dir(root_dir: Union[str, Path]) -> OutputSubDirectory:
         result[name.lower()] = output_dir
     return OutputSubDirectory(**result)
 
-
 def get_sub_dir(
         root_dir: Union[str, Path], split: Optional[str]) -> SubDirectory:
     result = dict()
@@ -99,6 +101,7 @@ class Preprocessor:
             augmented_tmp_dir: Union[str, Path],
             num_cores: int,
     ):
+        
         augment.augment_data(
             midi_path=str(source_dir),
             augmented_dir=str(augmented_dir),
@@ -106,18 +109,44 @@ class Preprocessor:
             num_cores=num_cores,
         )
 
+    # DOPT Change for Windows
+    
     def encode_event_sequence(self, midi_path: Union[str, Path], sample_info: Dict) -> np.ndarray:
-        with tempfile.NamedTemporaryFile(suffix=Path(midi_path).suffix) as f:
+        temp_dir = tempfile.gettempdir()
+        random_filename = f"{uuid.uuid4().hex}{Path(midi_path).suffix}"
+        temp_file_path = os.path.join(temp_dir, random_filename)
+        
+        try:
             midi_obj = miditoolkit.MidiFile(midi_path)
-            for idx in range(len(midi_obj.instruments)):
-                try:
-                    if midi_obj.instruments[idx].name == "chord":
-                        midi_obj.instruments.pop(idx)
-                except IndexError:
-                    continue
-            midi_obj.dump(f.name)
-            event_sequence = np.array(self.event_sequence_encoder.encode(midi_path, sample_info=sample_info))
+            
+            # 역순으로 순회하여 "chord" 악기 제거
+            for idx in range(len(midi_obj.instruments) - 1, -1, -1):
+                if midi_obj.instruments[idx].name != '':
+                    print(f"DOPT name is {midi_obj.instruments[idx].name}")
+                if midi_obj.instruments[idx].name == "chord":
+                    midi_obj.instruments.pop(idx)
+            
+            midi_obj.dump(temp_file_path)
+            
+            event_sequence = np.array(self.event_sequence_encoder.encode(temp_file_path, sample_info=sample_info))
             return event_sequence
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    # def encode_event_sequence(self, midi_path: Union[str, Path], sample_info: Dict) -> np.ndarray:
+        
+    #     with tempfile.NamedTemporaryFile(suffix=Path(midi_path).suffix, delete=False) as f:
+    #         midi_obj = miditoolkit.MidiFile(midi_path)
+    #         for idx in range(len(midi_obj.instruments)):
+    #             try:
+    #                 if midi_obj.instruments[idx].name == "chord":
+    #                     midi_obj.instruments.pop(idx)
+    #             except IndexError:
+    #                 continue
+    #         midi_obj.dump(f.name)
+    #         event_sequence = np.array(self.event_sequence_encoder.encode(midi_path, sample_info=sample_info))
+    #         return event_sequence
 
     def preprocess(
             self,
@@ -125,10 +154,11 @@ class Preprocessor:
             num_cores: int,
             data_split: Tuple[str] = ("train", "val",),
     ):
+        print(f"csv_path: {self.csv_path}")
         default_sub_dir = get_sub_dir(root_dir, split=None)
         fetched_samples = pd.read_csv(self.csv_path,
                                       converters={"chord_progressions": literal_eval})
-
+                
         for empty_dir in fields(default_sub_dir):
             if empty_dir.name in ("encode_npy",):
                 continue
@@ -158,8 +188,11 @@ class Preprocessor:
             )
 
             input_npy, target_npy = self.concat_npy(split_sub_dir.encode_tmp)
+            
             np.save(str(default_sub_dir.encode_npy.joinpath(f"input_{split}.npy")), input_npy, allow_pickle=True)
-            np.save(str(default_sub_dir.encode_npy.joinpath(f"target_{split}.npy")), target_npy, allow_pickle=True)
+            # np.save(str(default_sub_dir.encode_npy.joinpath(f"target_{split}.npy")), target_npy, allow_pickle=True)
+            # DOPT remove shape issues by saving as object
+            np.save(str(default_sub_dir.encode_npy.joinpath(f"target_{split}.npy")), np.array(target_npy, dtype=object), allow_pickle=True)
 
             for empty_dir in os.listdir(root_dir.joinpath(split)):
                 if empty_dir in ("raw", "npy_tmp", "augmented", "augmented_tmp"):

@@ -17,13 +17,18 @@ from commu.model.dataset import ComMUDataset
 from commu.model.exp_utils import logging_config
 from commu.model.model import MemTransformerLM
 
+from typing import Callable, Tuple
+
 @contextlib.contextmanager
 def sync_workers(args):
     """
     Yields distributed rank and synchronizes all workers on exit.
     """
-    yield args.local_rank
-    dist.barrier()
+    if args.distributed:
+        yield args.local_rank
+        dist.barrier()
+    else:
+        yield from contextlib.nullcontext()
 
 
 def save_checkpoint(
@@ -37,7 +42,7 @@ def save_checkpoint(
         name="checkpoint.pt",
 ):
     checkpoint = {
-        "model": model.module.state_dict(),
+        "model": model.module.state_dict() if args.distributed else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "train_step": train_step,
         "scheduler": scheduler.state_dict(),
@@ -57,21 +62,23 @@ def save_checkpoint(
 def parse_args():
     parser = argparse.ArgumentParser(description="PyTorch Transformer Language Model")
     parser.add_argument(
-        "--data_dir", type=str, required=True, help="location of the data corpus"
+        "--data_dir", type=str, help="location of the data corpus",
+        default="./dataset/commu_midi/output_npy"
     )
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument(
         "--work_dir",
         type=str,
-        required=True,
         help="Base directory to save the trained model.",
+        default="./working_directory"
     )
+    parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
     args = parser.parse_args()
     return args
 
 
 
-def evaluate(eval_iter):
+def evaluate(eval_iter: Callable) -> Tuple[int, float]:
     # Turn on evaluation mode def disables dropout.
     model.eval()
 
@@ -128,7 +135,10 @@ def train():
     for batch, (data, target, reset_mems, batch_token_num) in enumerate(
             train_real_iter
     ):
-        model.module.temperature = 1.0
+        if args.distributed:
+            model.module.temperature = 1.0
+        else:
+            model.temperature = 1.0
 
         model.zero_grad()
 
@@ -157,7 +167,9 @@ def train():
         log_token_num += int(batch_token_num)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.module.parameters(), cfg.TRAIN.clip
+            model.module.parameters(), cfg.TRAIN.clip            
+        ) if args.distributed else torch.nn.utils.clip_grad_norm_(
+            model.parameters(), cfg.TRAIN.clip
         )
 
         log_grad_norm += grad_norm
@@ -169,9 +181,10 @@ def train():
         scheduler.step()
 
         if train_step % cfg.TRAIN.log_interval == 0:
-            torch.distributed.all_reduce(log_train_loss)
-            torch.distributed.all_reduce(log_grad_norm)
-            torch.distributed.all_reduce(log_token_num)
+            if args.distributed:
+                torch.distributed.all_reduce(log_train_loss)
+                torch.distributed.all_reduce(log_grad_norm)
+                torch.distributed.all_reduce(log_token_num)
 
             log_train_loss /= log_token_num
             log_grad_norm /= cfg.TRAIN.log_interval * num_gpus
@@ -206,8 +219,9 @@ def train():
             val_token_num_pt = torch.tensor(val_token_num).to(device)
             val_total_nll_pt = torch.tensor(val_total_nll / 10000.0).to(device)
 
-            torch.distributed.all_reduce(val_token_num_pt)
-            torch.distributed.all_reduce(val_total_nll_pt)
+            if args.distributed:
+                torch.distributed.all_reduce(val_token_num_pt)
+                torch.distributed.all_reduce(val_total_nll_pt)
 
             val_token_num = val_token_num_pt.item()
             val_total_nll = val_total_nll_pt.item()
@@ -261,8 +275,9 @@ def train():
                     )
                     test_token_num_pt = torch.tensor(test_token_num).to(device)
                     test_total_nll_pt = torch.tensor(test_total_nll / 10000.0).to(device)
-                    torch.distributed.all_reduce(test_token_num_pt)
-                    torch.distributed.all_reduce(test_total_nll_pt)
+                    if args.distributed:
+                        torch.distributed.all_reduce(test_token_num_pt)
+                        torch.distributed.all_reduce(test_total_nll_pt)
 
                     test_token_num = test_token_num_pt.item()
                     test_nll = test_total_nll_pt.item() / (test_token_num / 10000.0)
@@ -288,12 +303,12 @@ def train():
             break
 
 
-def init_weight(weight):
+def init_weight(weight: torch.Tensor | nn.Parameter):
     init_std = cfg.INITIALIZER.base_init
     nn.init.normal_(weight, 0.0, init_std)
 
 
-def init_embed(weight):
+def init_embed(weight: torch.Tensor | nn.Parameter):
     init_std = cfg.INITIALIZER.embed_init
     nn.init.normal_(weight, 0.0, init_std)
 
@@ -356,12 +371,17 @@ def update_dropatt(m):
 
 args = parse_args()
 cfg = get_default_cfg_training()
-torch.cuda.set_device(args.local_rank)
-device = torch.device("cuda", args.local_rank)
-torch.distributed.init_process_group(backend="nccl", init_method="env://")
+if args.distributed:
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    device = torch.device("cuda", args.local_rank)
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 exp_time = torch.tensor(time.time(), dtype=torch.float64).to(device)
-torch.distributed.broadcast(exp_time, 0)
+if args.distributed:
+    torch.distributed.broadcast(exp_time, 0)
 exp_time = float(exp_time.cpu().numpy())
 
 args.work_dir = os.path.join(
@@ -396,25 +416,36 @@ num_gpus = torch.cuda.device_count()
 assert cfg.TRAIN.batch_size % num_gpus == 0
 batch_size = cfg.TRAIN.batch_size // num_gpus
 
-train_iter = dataset.get_iterator(
-    batch_size, cfg.TRAIN.tgt_length, device, "train", True, seed=local_seed
-)
-val_iter = dataset.eval_iterator(
-    cfg.EVALUATE.batch_size,
-    cfg.EVALUATE.tgt_length,
-    device,
-    "valid",
-    local_rank=args.local_rank,
-    world_size=num_gpus,
-)
-test_iter = dataset.eval_iterator(
-    cfg.EVALUATE.batch_size,
-    cfg.EVALUATE.tgt_length,
-    device,
-    "test",
-    local_rank=args.local_rank,
-    world_size=num_gpus,
-)
+if args.distributed:
+    train_iter = dataset.get_iterator(
+        batch_size, cfg.TRAIN.tgt_length, device, "train", True, seed=local_seed
+    )
+    val_iter = dataset.eval_iterator(
+        cfg.EVALUATE.batch_size,
+        cfg.EVALUATE.tgt_length,
+        device,
+        "valid",
+        local_rank=args.local_rank,
+        world_size=num_gpus,
+    )
+    test_iter = dataset.eval_iterator(
+        cfg.EVALUATE.batch_size,
+        cfg.EVALUATE.tgt_length,
+        device,
+        "test",
+        local_rank=args.local_rank,
+        world_size=num_gpus,
+    )
+else:
+    train_iter = dataset.get_iterator(
+        batch_size, cfg.TRAIN.tgt_length, device, "train", True, seed=cfg.TRAIN.seed
+    )
+    val_iter = dataset.eval_iterator(
+        cfg.EVALUATE.batch_size, cfg.EVALUATE.tgt_length, device, "valid"
+    )
+    test_iter = dataset.eval_iterator(
+        cfg.EVALUATE.batch_size, cfg.EVALUATE.tgt_length, device, "test"
+    )
 
 
 ###############################################################################
@@ -464,13 +495,18 @@ scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 train_step = 0
 best_val_nll = np.inf
 
-model = DDP(
-    model,
-    device_ids=[args.local_rank],
-    output_device=args.local_rank,
-    broadcast_buffers=False,
-    find_unused_parameters=False,
-)
+
+if args.distributed:
+    model = DDP(
+        model,
+        device_ids=[args.local_rank],
+        output_device=args.local_rank,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+else:
+    model = model.to(device)
+
 
 logger.info("=" * 100)
 logger.info(args)
@@ -499,10 +535,14 @@ if __name__ == "__main__":
     test_token_num, test_total_nll = evaluate(
         eval_iter=test_iter
     )
+    # 이 코드의 역할은 테스트 결과를 텐서로 변환하고 GPU로 이동시키는 것입니다.
+    # test_token_num과 test_total_nll을 텐서로 변환하여 device(GPU)로 이동시킵니다.
+    # test_total_nll은 10000으로 나누어 스케일을 조정합니다.
     test_token_num_pt = torch.tensor(test_token_num).to(device)
     test_total_nll_pt = torch.tensor(test_total_nll / 10000.0).to(device)
-    torch.distributed.all_reduce(test_token_num_pt)
-    torch.distributed.all_reduce(test_total_nll_pt)
+    if args.distributed:
+        torch.distributed.all_reduce(test_token_num_pt)
+        torch.distributed.all_reduce(test_total_nll_pt)
     test_token_num = test_token_num_pt.item()
     test_nll = test_total_nll_pt.item() / (test_token_num / 10000.0)
     logger.info("=" * 100)

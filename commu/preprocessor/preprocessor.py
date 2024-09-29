@@ -181,12 +181,13 @@ class Preprocessor:
                 *(split_sub_dir.raw, split_sub_dir.augmented))
 
             self.export_encoded_midi(
-                fetched_samples=fetched_samples,
-                encoded_tmp_dir=split_sub_dir.encode_tmp,
-                sample_id_to_path=sample_id_to_path,
+                fetched_samples=fetched_samples, # cvs file
+                encoded_tmp_dir=split_sub_dir.encode_tmp, #npy_tmp
+                sample_id_to_path=sample_id_to_path, # { "commu_1111": "augmented/commu_1111.mid" }
                 num_cores=num_cores,
             )
 
+            # 생성된 npy 파일 합치기
             input_npy, target_npy = self.concat_npy(split_sub_dir.encode_tmp)
             
             np.save(str(default_sub_dir.encode_npy.joinpath(f"input_{split}.npy")), input_npy, allow_pickle=True)

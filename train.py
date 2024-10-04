@@ -72,7 +72,7 @@ def parse_args():
         help="Base directory to save the trained model.",
         default="./working_directory"
     )
-    parser.add_argument("--distributed", action="store_false", help="Enable distributed training")
+    parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
     args = parser.parse_args()
     return args
 

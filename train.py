@@ -55,7 +55,7 @@ def save_checkpoint(
     with sync_workers(args) as rank:
         path = os.path.join(args.work_dir, name)
         logger.info(f"Saving checkpoint to {path}")
-        if rank == 0:
+        if not args.distributed or rank == 0:
             torch.save(checkpoint, path)
 
 
@@ -72,7 +72,7 @@ def parse_args():
         help="Base directory to save the trained model.",
         default="./working_directory"
     )
-    parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
+    parser.add_argument("--distributed", action="store_false", help="Enable distributed training")
     args = parser.parse_args()
     return args
 
@@ -411,10 +411,19 @@ logger.info("Loading data")
 dataset = ComMUDataset(args.data_dir, cfg)
 vocab = dataset.vocab
 
-local_seed = cfg.TRAIN.seed + args.local_rank * 1000
-num_gpus = torch.cuda.device_count()
-assert cfg.TRAIN.batch_size % num_gpus == 0
-batch_size = cfg.TRAIN.batch_size // num_gpus
+if args.distributed:
+    num_gpus = torch.cuda.device_count()
+    batch_size = cfg.TRAIN.batch_size // num_gpus
+    local_seed = cfg.TRAIN.seed + args.local_rank * 1000
+else:
+    num_gpus = 1
+    batch_size = cfg.TRAIN.batch_size
+    local_seed = cfg.TRAIN.seed
+
+# local_seed = cfg.TRAIN.seed + args.local_rank * 1000
+# num_gpus = torch.cuda.device_count()
+# assert cfg.TRAIN.batch_size % num_gpus == 0
+# batch_size = cfg.TRAIN.batch_size // num_gpus
 
 if args.distributed:
     train_iter = dataset.get_iterator(

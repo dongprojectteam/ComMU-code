@@ -136,3 +136,5 @@ tmp*.py
 
 # shell script
 *.sh
+
+my_test/*
